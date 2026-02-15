@@ -240,4 +240,4 @@ safe-tool-call/
 
 ## Built by
 
-[Ikigai Digital](https://ikigai.digital)
+[Ikigai Digital](https://ikigaidigital.io)
