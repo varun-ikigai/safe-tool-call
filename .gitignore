@@ -1,0 +1,5 @@
+node_modules/
+audit-logs/
+dist/
+.env
+*.log
