@@ -17,10 +17,12 @@ This is an embeddable TypeScript/Bun library that sits between LLM agents and in
 - **Runtime:** Bun
 - **Language:** TypeScript (strict mode, no `any`)
 - **Schema validation:** Zod
-- **gRPC:** `@grpc/grpc-js`, `@grpc/proto-loader`
 - **JWT:** `jose`
+- **CLI execution:** `Bun.spawn` (array args, no shell -- this is a security invariant)
+- **gRPC:** `@grpc/grpc-js`, `@grpc/proto-loader` (Phase 4, not yet implemented)
 - **Audit:** Structured JSON lines
 - **Testing:** `bun:test`
+- **Eval harness:** Docker, OpenRouter API
 
 ## Code Standards
 
@@ -68,6 +70,7 @@ src/
   index.ts        # Public API exports
 tools/            # Example tool manifests
 tests/            # Test files mirror src/ structure
+eval/             # Containerised agent eval harness (Docker, OpenRouter)
 ```
 
 Note: handlers will expand to include CLI command handlers (for logcli, git, kubectl, argocd) alongside gRPC handlers. The proxy engine is transport-agnostic -- it validates inputs and filters outputs the same way regardless of whether the underlying handler makes a gRPC call or executes a bounded CLI command.
@@ -88,7 +91,7 @@ Note: handlers will expand to include CLI command handlers (for logcli, git, kub
 
 4. **Audit logging is fire-and-forget.** A failed audit write should log to stderr but not fail the tool call. The tool call result is more important than the audit entry.
 
-5. **gRPC is the primary handler type for MVP.** CLI command handlers (for logcli, git, kubectl, argocd) are also in scope. The handler abstraction is simple: a handler is an async function that takes validated input and returns output. Don't over-abstract beyond what gRPC and CLI handlers need.
+5. **CLI handlers (Bun.spawn) are the primary handler type for MVP.** gRPC handlers are planned for Phase 4. The handler abstraction is simple: a handler is an async function that takes validated input and returns output. Don't over-abstract beyond what CLI and (eventually) gRPC handlers need.
 
 ## What Not To Do
 
