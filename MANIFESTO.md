@@ -18,16 +18,46 @@ Safe Tool Call exists because the answer to "can this agent access production?" 
 
 ## What We Are
 
-Safe Tool Call is a **governed gateway between LLM agents and your microservice infrastructure.**
+Safe Tool Call is a **governed gateway between LLM agents and your infrastructure.**
+
+Not just your microservices. Everything. gRPC service calls, git operations, log queries, deployment tools, Kubernetes reads -- every action an agent takes passes through the same validation, permission, and audit boundary.
 
 Every tool call an agent can make is:
 
-- **Declared** -- authored by the team that owns the service, published as a typed manifest alongside their code.
-- **Schema-validated** -- inputs are validated against Zod schemas before execution. Malformed requests never reach your services.
-- **Permission-scoped** -- callers present a JWT. The proxy checks their permissions against the tool's requirements. No match, no execution.
+- **Declared** -- authored by the team that owns the capability, published as a typed manifest. A gRPC method, a logcli query, a git diff, an ArgoCD sync status check -- they're all tool definitions with the same shape.
+- **Schema-validated** -- inputs are validated against Zod schemas before execution. A log query can only target the namespaces declared in the schema. A git diff can only compare branches that match the allowed pattern. Malformed or overreaching requests never execute.
+- **Permission-scoped** -- callers present a JWT. The proxy checks their permissions against the tool's requirements. No match, no execution. An agent with `logs:read` cannot call `argocd_sync`. An agent with `git:read` cannot call `git_delete_branch`.
+- **Classification-constrained** -- every tool is classified as `read`, `write`, or `destructive`. Read tools cannot mutate state. This isn't a suggestion to the model -- it's a property of the tool definition that the proxy enforces.
 - **PII-protected** -- output fields are allowlisted. The LLM only sees what it's explicitly permitted to see. Sensitive data is masked or stripped before it enters the model's context.
 - **Audited** -- every call, allowed or denied, is logged with caller identity, tool name, arguments, result, and decision. Structured, queryable, ready for compliance review.
-- **Transport-automated** -- mTLS, bearer tokens, gRPC metadata, protobuf serialisation -- the proxy handles the plumbing. Service teams don't build "agent-friendly" adapters. They declare a manifest and the proxy does the rest.
+- **Transport-automated** -- mTLS, bearer tokens, gRPC metadata, CLI argument construction, logcli auth -- the proxy handles the plumbing. Teams declare a manifest and the proxy does the rest.
+
+## It's Not Just About Network Calls
+
+A common misconception is that tool call governance is only needed for service-to-service communication. But consider what a capable remote agent actually needs to do its job:
+
+- **Read logs** to diagnose a production incident (`logcli query '{namespace="customer-data"}'`)
+- **Pull code** and read diffs to understand what changed between deployments (`git diff release/1.1.18..release/1.1.19`)
+- **Check deployment state** via ArgoCD (`argocd app get customer-master-service`)
+- **Query Kubernetes** for pod health (`kubectl get pods -n customer-data`)
+- **Trace workflows** in Temporal (`tctl workflow describe -w <workflow-id>`)
+
+Every one of these, given to an agent as a raw CLI command, is a vector for abuse. `logcli query` becomes `logcli query '{}'` (all logs in the cluster). `git diff` becomes `git push --force`. `kubectl get pods` becomes `kubectl delete pod`. `argocd app get` becomes `argocd app sync --force`.
+
+Safe Tool Call wraps each of these as a **bounded, typed, audited tool**:
+
+```
+Instead of:  bash("logcli query '{namespace=\"customer-data\"}' --limit 100")
+The agent gets: query_logs({ namespace: "customer-data", query: "{level=\"error\"}", limit: 100 })
+
+Instead of:  bash("git diff main..release/1.1.19 -- src/")
+The agent gets: git_diff_branches({ base: "main", compare: "release/1.1.19", path: "src/" })
+
+Instead of:  bash("argocd app get customer-master-service -o json")
+The agent gets: argocd_get_app({ name: "customer-master-service" })
+```
+
+The agent gets the **read capability** without the blast radius. It can query logs but not delete them. It can diff branches but not push code. It can check deployment status but not trigger a sync. The tool definition mechanically prevents the action, regardless of what the model decides to try.
 
 ## What We Are Not
 
@@ -41,38 +71,40 @@ In a Safe Tool Call deployment, an LLM agent has **no bash access, no direct net
 
 ```
                   The LLM sees this:
-                  ┌──────────────────────────┐
-                  │  get_customer(id)         │
-                  │  list_transactions(...)   │
-                  │  get_sync_status(app)     │
-                  │  ...and nothing else.     │
-                  └────────────┬─────────────┘
-                               │
+                  ┌──────────────────────────────┐
+                  │  get_customer(id)             │  ← gRPC service call
+                  │  query_logs(namespace, query) │  ← logcli
+                  │  git_diff_branches(base, cmp) │  ← git (read-only)
+                  │  argocd_get_app(name)         │  ← ArgoCD
+                  │  k8s_get_pods(namespace)      │  ← kubectl (read-only)
+                  │  ...and nothing else.         │
+                  └──────────────┬───────────────┘
+                                │
                   The proxy enforces this:
-                  ┌────────────┴─────────────┐
-                  │  Is this tool registered? │
-                  │  Does the caller have     │
-                  │    permission?             │
-                  │  Are the inputs valid?     │
-                  │  [execute]                 │
-                  │  Are outputs safe to       │
-                  │    return?                 │
-                  │  [audit everything]        │
-                  └──────────────────────────┘
+                  ┌──────────────┴───────────────┐
+                  │  Is this tool registered?     │
+                  │  Does the caller have         │
+                  │    permission?                 │
+                  │  Are the inputs valid?         │
+                  │  Is the classification safe?   │
+                  │  [execute via handler]         │
+                  │  Are outputs safe to return?   │
+                  │  [audit everything]            │
+                  └──────────────────────────────┘
 ```
 
 No amount of context rot, prompt injection, or model hallucination can bypass this boundary. The proxy doesn't read the LLM's reasoning. It validates a structured tool call against a registered schema. That's it.
 
 ## The Developer Experience
 
-We believe the right security model is one that developers actually use. Safe Tool Call is designed for the teams that build and own microservices:
+We believe the right security model is one that developers actually use. Safe Tool Call is designed for the teams that own capabilities across your platform:
 
-1. **Author a tool manifest** next to your service code. Declare which gRPC methods are exposed, what permissions they require, which output fields are safe for an LLM to see.
-2. **Validate in CI.** Schema correctness, PII coverage, permission sanity -- all checked before merge.
-3. **Publish on deploy.** When your service ships, its tool manifest updates in the registry.
-4. **Any authorised agent can now use your tools safely.** The proxy handles authentication, serialisation, filtering, and auditing.
+1. **Author a tool manifest** next to the capability you own. A microservice team declares their gRPC methods. A platform team declares the ArgoCD, Kubernetes, and log query tools. A release team declares the git operations. Each manifest specifies inputs, outputs, permissions, and classification.
+2. **Validate in CI.** Schema correctness, PII coverage, permission sanity, classification accuracy -- all checked before merge.
+3. **Publish on deploy.** When your service ships, its tool manifest updates in the registry. When the platform team updates the allowed log namespaces, the tool schema changes.
+4. **Any authorised agent can now use your tools safely.** The proxy handles authentication, transport plumbing, output filtering, and auditing.
 
-The proxy automates the tedious parts -- mTLS handshakes, token refresh, protobuf-to-JSON conversion, structured audit logging -- so that exposing a gRPC method as an agent tool is a five-minute task, not a week-long integration project.
+The proxy automates the tedious parts -- mTLS handshakes, token refresh, protobuf-to-JSON conversion, CLI argument construction, structured audit logging -- so that exposing a capability as an agent tool is a five-minute task, not a week-long integration project.
 
 ## Why Smarter Models Make This More Necessary, Not Less
 

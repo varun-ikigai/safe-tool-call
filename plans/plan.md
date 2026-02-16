@@ -2,10 +2,10 @@
 
 ## Overview
 
-Build a runtime proxy and manifest SDK that allows LLM agents to call gRPC microservice methods through a governed, schema-validated, PII-filtered, audited interface. No bash, no raw network access -- just declared, typed tool calls.
+Build a runtime proxy and manifest SDK that allows LLM agents to interact with infrastructure through governed, schema-validated, PII-filtered, audited tool calls. This covers gRPC service methods, CLI commands (logcli, git, kubectl, argocd), and any other bounded operation. No bash, no raw CLI access -- just declared, typed tool calls.
 
 **Tech stack:** TypeScript, Bun, Zod, gRPC  
-**Target environment:** Self-hosted, mTLS service mesh, Kotlin/Spring Boot gRPC services  
+**Target environment:** Self-hosted, mTLS service mesh, Kotlin/Spring Boot gRPC services, platform CLI tools  
 **Reference service:** `customer-data/customer-master-service` (6 gRPC methods, hexagonal architecture, protobuf contracts via Buf)
 
 ---
@@ -13,29 +13,32 @@ Build a runtime proxy and manifest SDK that allows LLM agents to call gRPC micro
 ## Architecture
 
 ```
-Service Team                        Agent (LLM)
-     │                                   │
-     ▼                                   │
-┌──────────────┐                         │
-│ Tool Manifest│   ← defineTool()        │
-│ (in service  │     SDK                 │
-│  repo)       │                         │
-└──────┬───────┘                         │
-       │ loaded at startup               │
-       ▼                                 │
-┌─────────────────────────────────┐      │
-│        Runtime Proxy            │◄─────┘  proxy.call("get_customer", {id: "..."})
-│                                 │
-│  1. Registry lookup             │
-│  2. JWT permission check        │
-│  3. Zod input validation        │
-│  4. gRPC call (mTLS, auth)      │
-│  5. Output allowlist filtering  │
-│  6. PII masking                 │
-│  7. Audit log write             │
-│                                 │
-│  → return filtered result       │
-└─────────────────────────────────┘
+Service Team / Platform Team            Agent (LLM)
+     │                                       │
+     ▼                                       │
+┌──────────────┐                             │
+│ Tool Manifest│   ← defineTool()            │
+│ (in service  │     SDK                     │
+│  or platform │                             │
+│  repo)       │                             │
+└──────┬───────┘                             │
+       │ loaded at startup                   │
+       ▼                                     │
+┌─────────────────────────────────────┐      │
+│          Runtime Proxy              │◄─────┘  proxy.call("get_customer", {id: "..."})
+│                                     │         proxy.call("query_logs", {namespace: "..."})
+│  1. Registry lookup                 │         proxy.call("git_diff_branches", {base: "..."})
+│  2. JWT permission check            │
+│  3. Zod input validation            │
+│  4. Handler execution               │
+│     ├─ gRPC call (mTLS, auth)       │───► gRPC services
+│     └─ CLI command (bounded args)   │───► logcli, git, kubectl, argocd
+│  5. Output validation               │
+│  6. Output allowlist / PII masking  │
+│  7. Audit log write                 │
+│                                     │
+│  → return filtered result           │
+└─────────────────────────────────────┘
 ```
 
 ---
@@ -64,12 +67,15 @@ Service Team                        Agent (LLM)
 - [ ] **1.2** Core type definitions (`src/core/types.ts`)
   - `ToolDefinition<TInput, TOutput>` -- the manifest type
   - `ToolClassification` -- `"read" | "write" | "destructive"`
-  - `ToolTarget` -- target system, gRPC service/method/package
+  - `ToolTarget` -- union type:
+    - `GrpcTarget` -- target system, gRPC service/method/package
+    - `CliTarget` -- command, args builder function, optional cwd
   - `ToolPermissions` -- required permissions, elevated permissions with condition
   - `OutputFieldPolicy` -- `"allow" | "mask" | "redact"` per field
   - `CallerContext` -- decoded JWT claims (sub, permissions, iat, exp)
   - `AuditEntry` -- structured audit log record
   - `ToolCallResult<T>` -- success/denied/error union type
+  - `ToolHandler` -- async function `(input, ctx) => output` -- the transport-agnostic handler interface
 
 - [ ] **1.3** `defineTool()` builder function (`src/core/define-tool.ts`)
   - Type-safe builder that returns a `ToolDefinition`
@@ -208,11 +214,13 @@ Service Team                        Agent (LLM)
 
 ---
 
-## Phase 3: gRPC Handler
+## Phase 3: Handlers (gRPC + CLI)
 
-**Goal:** A handler factory that makes gRPC calls to backend services, handling mTLS, protobuf serialisation, and auth.
+**Goal:** Handler factories for both gRPC service calls and bounded CLI commands. The proxy engine doesn't care which handler type a tool uses -- it validates the same way regardless.
 
 ### Tasks
+
+#### 3A: gRPC Handler
 
 - [ ] **3.1** gRPC connection manager (`src/handlers/grpc/connection.ts`)
   - Manages gRPC channels per target system
@@ -248,20 +256,52 @@ Service Team                        Agent (LLM)
   - gRPC status code mapping to tool call errors
   - Metadata forwarding (trace IDs, caller identity for downstream audit)
 
+#### 3B: CLI Command Handler
+
+- [ ] **3.4** CLI command handler (`src/handlers/cli/handler.ts`)
+  - `cliCommand({ command, argsBuilder, cwd? })` returns a handler function
+  - **Security model:**
+    - The command is fixed in the tool definition (e.g., `"logcli"`, `"git"`, `"kubectl"`, `"argocd"`)
+    - Arguments are constructed from validated input via `argsBuilder` function -- the agent never provides raw CLI strings
+    - Commands are executed via `Bun.spawn` (not shell execution -- no shell injection)
+    - Optional allowlist of permitted base commands
+  - Captures stdout, stderr, exit code
+  - Timeout handling (configurable per tool, default 30s)
+  - Exit code mapping to tool call errors (non-zero = error)
+  - stdout/stderr parsing: handler can return raw text or parse JSON output
+
+- [ ] **3.5** CLI output parser (`src/handlers/cli/parser.ts`)
+  - Parse common output formats: JSON, JSONL (logcli), plain text (git diff), tabular (kubectl)
+  - Return structured output that matches the tool's output Zod schema
+  - Strip ANSI escape codes, terminal formatting
+
+- [ ] **3.6** Example CLI tool definitions:
+  - `query_logs` -- logcli with bounded namespace enum, time range, limit
+  - `git_diff_branches` -- git diff with regex-constrained branch patterns, read-only
+  - `git_log` -- git log with bounded count and format, read-only
+  - `argocd_get_app` -- ArgoCD app status, read-only
+  - `argocd_get_sync_status` -- ArgoCD sync status, read-only
+  - `k8s_get_pods` -- kubectl get pods with bounded namespace enum, read-only
+  - `k8s_get_events` -- kubectl get events with bounded namespace, read-only
+
+  **Key constraint:** Every CLI tool in the initial set is `classification: "read"`. Write/destructive CLI tools (argocd sync, git push) are intentionally excluded from the initial tool set to prove the read-only safety model first.
+
 ---
 
 ## Phase 4: Example Tool Manifests
 
-**Goal:** Demonstrate the SDK by wrapping the `customer-master-service` gRPC methods as safe tool calls.
+**Goal:** Demonstrate the SDK across both handler types -- gRPC service calls and bounded CLI commands.
 
 ### Tasks
+
+#### 4A: gRPC Tool Manifests (customer-master-service)
 
 - [ ] **4.1** Shared schemas (`tools/customer-data/schemas.ts`)
   - Zod schemas for `Customer`, `Address`, `PersonName`, `CustomerStatus` etc.
   - Derived from the protobuf `primitives.v1` definitions
   - These are the OUTPUT schemas -- what the proxy validates against
 
-- [ ] **4.2** Tool manifests for all 6 methods:
+- [ ] **4.2** Tool manifests for all 6 gRPC methods:
   - `tools/customer-data/get-customer.ts` -- read, customer-data:read
   - `tools/customer-data/get-legacy-customer.ts` -- read, customer-data:read
   - `tools/customer-data/list-customers.ts` -- read, customer-data:read, PII masking on search results
@@ -269,7 +309,7 @@ Service Team                        Agent (LLM)
   - `tools/customer-data/update-customer.ts` -- write, customer-data:write
   - `tools/customer-data/update-customer-status.ts` -- write, customer-data:write, elevated for destructive transitions (OFFBOARDED, BLOCKED)
 
-- [ ] **4.3** PII output policies for each tool
+- [ ] **4.3** PII output policies for each gRPC tool
   - `fullName` → mask
   - `email`, `phone`, `nationalId`, `dateOfBirth`, `taxNumber` → redact
   - `address` → redact (full object)
@@ -277,6 +317,31 @@ Service Team                        Agent (LLM)
   - `employerName`, `employerAddress` → redact
   - `nextOfKin` → redact (full object)
   - Account IDs, status, external references → allow
+
+#### 4B: CLI Tool Manifests (platform tools)
+
+- [ ] **4.4** Log query tools (`tools/platform/query-logs.ts`)
+  - `query_logs` -- logcli query with namespace enum, time range, limit
+  - Namespace restricted to known bounded contexts
+  - Output filtered to strip log lines containing PII patterns
+
+- [ ] **4.5** Git tools (`tools/platform/git-*.ts`)
+  - `git_diff_branches` -- diff between two branches (read-only, regex-constrained branch patterns)
+  - `git_log` -- commit log with bounded count (read-only)
+  - `git_show_file` -- show file at a given ref (read-only)
+  - Repository restricted to known service repos via enum
+
+- [ ] **4.6** ArgoCD tools (`tools/platform/argocd-*.ts`)
+  - `argocd_get_app` -- app details (read-only)
+  - `argocd_get_sync_status` -- sync state and health (read-only)
+  - `argocd_diff` -- diff between live and desired state (read-only)
+  - App names restricted to known applications via enum
+
+- [ ] **4.7** Kubernetes tools (`tools/platform/k8s-*.ts`)
+  - `k8s_get_pods` -- pod list with namespace enum and optional label selector (read-only)
+  - `k8s_get_events` -- events with namespace enum (read-only)
+  - `k8s_get_logs` -- pod logs with namespace, pod name, line limit (read-only)
+  - Namespace restricted to known bounded contexts
 
 ---
 
@@ -297,14 +362,24 @@ Service Team                        Agent (LLM)
   - Returns realistic protobuf responses
   - Simulates errors (NOT_FOUND, UNAVAILABLE, DEADLINE_EXCEEDED)
 
-- [ ] **5.3** Integration tests
+- [ ] **5.3** CLI handler tests
+  - Mock command execution (stub `Bun.spawn`)
+  - Verify args are constructed correctly from validated input
+  - Verify no shell injection is possible (args are arrays, not strings)
+  - Test output parsing for JSON, JSONL, plain text formats
+  - Test timeout and non-zero exit code handling
+
+- [ ] **5.4** Integration tests
   - Full proxy flow: register tools → call with valid JWT → verify response is filtered and audited
   - Denial scenarios: unknown tool, bad JWT, missing permissions, invalid input
+  - CLI tool denial: agent tries to pass args that fail schema validation (e.g., invalid namespace)
   - Audit log verification: every scenario produces correct audit entry
 
-- [ ] **5.4** Developer smoke test
-  - Script that starts mock gRPC server + proxy, calls each tool, prints results
+- [ ] **5.5** Developer smoke test
+  - Script that starts mock gRPC server + proxy, calls each tool type, prints results
   - Demonstrates: "this is what an agent sees when it calls get_customer"
+  - Demonstrates: "this is what happens when an agent tries to query an unauthorized namespace"
+  - Demonstrates: "this is what a bounded git diff looks like through the proxy"
 
 ---
 
@@ -353,9 +428,10 @@ Service Team                        Agent (LLM)
 - Central registry (tools are loaded from local files)
 - Rate limiting / circuit breakers
 - CLI tooling (`stc validate`, `stc test`, `stc publish`)
-- Multi-transport (REST, CLI handlers) -- gRPC only for MVP
+- REST handler type (gRPC and CLI cover the MVP use cases)
 - Proto registry integration (Buf Schema Registry)
 - Canary deployments / rollback
+- Write/destructive CLI tools (argocd sync, git push, kubectl apply) -- read-only CLI tools first
 
 ---
 
@@ -363,10 +439,15 @@ Service Team                        Agent (LLM)
 
 The MVP is done when:
 
-1. A developer can define a tool manifest in ~20 lines of TypeScript
+1. A developer can define a tool manifest in ~20 lines of TypeScript -- for both gRPC and CLI tools
 2. The proxy rejects any call not in the registry (deny by default)
-3. The proxy validates inputs against Zod schemas before any gRPC call
+3. The proxy validates inputs against Zod schemas before any handler execution
 4. The proxy strips/masks PII fields before returning results to the agent
 5. Every tool call (allowed or denied) produces a structured audit log entry
-6. An LLM agent, given only the tool definitions (no bash), can query customer data safely
-7. The whole thing runs on Bun, self-hosted, no external dependencies beyond the target gRPC services
+6. An LLM agent, given only the tool definitions (no bash), can:
+   - Query customer data via gRPC service calls
+   - Read application logs via bounded logcli queries
+   - Diff branches and read git history via bounded git commands
+   - Check deployment and pod status via bounded ArgoCD/kubectl commands
+7. The agent **cannot** delete branches, push code, trigger deployments, delete logs, or access namespaces/repos outside the declared enums
+8. The whole thing runs on Bun, self-hosted, no external dependencies beyond the target services and CLI tools

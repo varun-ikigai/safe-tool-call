@@ -4,9 +4,11 @@ You are working on **Safe Tool Call**, a governed runtime proxy for LLM agent to
 
 ## Project Context
 
-This is an embeddable TypeScript/Bun library that sits between LLM agents and gRPC microservices in financial institutions. It enforces schema validation, permission checking, PII filtering, and audit logging on every tool call.
+This is an embeddable TypeScript/Bun library that sits between LLM agents and infrastructure in financial institutions. It enforces schema validation, permission checking, PII filtering, and audit logging on every tool call -- whether that's a gRPC service method, a logcli query, a git operation, an ArgoCD status check, or a kubectl read.
 
-**Target users:** Developers at banks who build microservices (Kotlin/Spring Boot/gRPC) and want to safely expose service methods to LLM agents.
+**The core principle:** An agent gets typed, bounded tool calls -- not bash access. The tool definition mechanically constrains what the agent can do. A `query_logs` tool with `namespace: z.enum(["customer-data", "payments"])` cannot query arbitrary namespaces, regardless of what the model decides to try. A `git_diff_branches` tool with `classification: "read"` cannot push, delete, or force-push.
+
+**Target users:** Developers at banks who build microservices (Kotlin/Spring Boot/gRPC) and platform teams who manage infrastructure tooling (ArgoCD, Kubernetes, Loki, Temporal, Git). Both need to safely expose capabilities to LLM agents.
 
 **Reference architecture:** See `reference_data/customer-data/` for a real microservice this tool is designed to wrap. It's a Kotlin hexagonal architecture service with 6 gRPC methods, Temporal workflows, Kafka events, and PostgreSQL persistence.
 
@@ -38,9 +40,10 @@ This is an embeddable TypeScript/Bun library that sits between LLM agents and gR
 
 ### Architecture
 - This is a library, not a server. The public API is an importable module.
-- Core logic has zero side effects and is pure where possible. Side effects (gRPC calls, file writes) are isolated in handler and audit modules.
+- Core logic has zero side effects and is pure where possible. Side effects (gRPC calls, CLI execution, file writes) are isolated in handler and audit modules.
 - Every module should be independently testable. No hidden global state.
 - The proxy flow is a pipeline: registry lookup → JWT verify → permission check → schema validate → execute → output validate → PII filter → audit. Each step is a separate, composable function.
+- Handlers are the transport layer. gRPC handlers call services. CLI handlers execute bounded commands (logcli, git, kubectl, argocd). The proxy engine doesn't care which handler type a tool uses -- it validates the same way regardless.
 
 ### Security Posture (Non-Negotiable)
 - **Deny by default.** Unregistered tools, unmatched permissions, unmatched output fields -- all denied.
@@ -67,6 +70,8 @@ tools/            # Example tool manifests
 tests/            # Test files mirror src/ structure
 ```
 
+Note: handlers will expand to include CLI command handlers (for logcli, git, kubectl, argocd) alongside gRPC handlers. The proxy engine is transport-agnostic -- it validates inputs and filters outputs the same way regardless of whether the underlying handler makes a gRPC call or executes a bounded CLI command.
+
 ## Git Conventions
 
 - Sign all commits: `git commit -S -m "message"`
@@ -79,17 +84,17 @@ tests/            # Test files mirror src/ structure
 
 2. **Output policy defaults to deny.** Fields not explicitly listed in the output policy are stripped. This prevents new protobuf fields from accidentally leaking to agents.
 
-3. **The proxy is synchronous in its decision logic.** The only async operation is the handler execution (the gRPC call). Validation, permission checks, and filtering are all synchronous.
+3. **The proxy is synchronous in its decision logic.** The only async operation is the handler execution (the gRPC call or CLI command). Validation, permission checks, and filtering are all synchronous.
 
 4. **Audit logging is fire-and-forget.** A failed audit write should log to stderr but not fail the tool call. The tool call result is more important than the audit entry.
 
-5. **gRPC is the only handler type for MVP.** REST and CLI handlers are planned but not yet implemented. Don't build abstractions for handlers that don't exist yet.
+5. **gRPC is the primary handler type for MVP.** CLI command handlers (for logcli, git, kubectl, argocd) are also in scope. The handler abstraction is simple: a handler is an async function that takes validated input and returns output. Don't over-abstract beyond what gRPC and CLI handlers need.
 
 ## What Not To Do
 
 - Don't add a web UI or HTTP server. This is an embeddable library.
 - Don't add a database dependency. Audit logs are JSON files. Tool definitions are TypeScript files.
-- Don't over-abstract. If there's only one handler type (gRPC), don't build a complex handler plugin system.
+- Don't over-abstract. If there are only two handler types (gRPC and CLI), don't build a complex handler plugin system.
 - Don't use `console.log`. Use structured logging that can be configured (silent in tests, verbose in dev).
 - Don't store or cache PII anywhere -- not in memory beyond the request lifecycle, not in logs, not in error messages.
 

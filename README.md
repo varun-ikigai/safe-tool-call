@@ -1,22 +1,22 @@
 # Safe Tool Call
 
-A governed runtime proxy for LLM agent tool calls. Define, validate, and audit every interaction between your AI agents and your microservice infrastructure.
+A governed runtime proxy for LLM agent tool calls. Define, validate, and audit every interaction between your AI agents and your infrastructure -- gRPC services, log queries, git operations, deployment tools, and anything else an agent needs to touch.
 
-Built for financial institutions. No bash. No raw network access. No trust required.
+Built for financial institutions. No bash. No raw CLI access. No trust required.
 
 ## The Problem
 
-LLM agents need to interact with your services. The default approach -- bash access with prompt-level restrictions -- offers no mechanical safety guarantees. Prompt instructions degrade with context length, are vulnerable to injection, and leave no audit trail.
+LLM agents need to interact with your systems. Not just your microservices -- they need to read logs, diff branches, check deployment status, query Kubernetes, trace workflows. The default approach -- bash access with prompt-level restrictions -- offers no mechanical safety guarantees. An agent that can `logcli query` can also `logcli query '{}'` (all logs). An agent that can `git diff` can also `git push --force`. Prompt instructions degrade with context length, are vulnerable to injection, and leave no audit trail.
 
 ## The Solution
 
-Safe Tool Call sits between your LLM agents and your gRPC services. Microservice teams publish **tool manifests** declaring which methods are available to agents, what permissions they require, and which output fields are safe to expose. The runtime proxy enforces these declarations on every call.
+Safe Tool Call sits between your LLM agents and your infrastructure. Teams publish **tool manifests** declaring which capabilities are available to agents, what permissions they require, what inputs are valid, and which output fields are safe to expose. The runtime proxy enforces these declarations on every call.
 
 ```
-Agent                  Safe Tool Call Proxy              Your gRPC Service
+Agent                  Safe Tool Call Proxy              Your Infrastructure
   │                         │                                │
   ├─ call("get_customer")──►│                                │
-  │                         ├─ JWT verify                    │
+  │                         ├─ JWT verify                    │ gRPC Service
   │                         ├─ Permission check              │
   │                         ├─ Zod input validation          │
   │                         ├─ gRPC call (mTLS) ────────────►│
@@ -25,6 +25,19 @@ Agent                  Safe Tool Call Proxy              Your gRPC Service
   │                         ├─ PII masking/redaction         │
   │                         ├─ Audit log write               │
   │◄─ filtered result ─────┤                                │
+  │                         │                                │
+  ├─ call("query_logs") ───►│                                │ LogCLI
+  │                         ├─ Validates namespace is allowed │
+  │                         ├─ Executes bounded logcli cmd ─►│
+  │                         ├─ Filters sensitive log lines   │
+  │                         ├─ Audit log write               │
+  │◄─ filtered logs ───────┤                                │
+  │                         │                                │
+  ├─ call("git_diff") ────►│                                │ Git (read-only)
+  │                         ├─ Validates branch patterns     │
+  │                         ├─ Executes read-only git cmd ──►│
+  │                         ├─ Audit log write               │
+  │◄─ diff output ─────────┤                                │
 ```
 
 ## Quick Start
@@ -39,10 +52,11 @@ cd safe-tool-call
 bun install
 ```
 
-### Define a Tool
+### Define Tools
 
-Tool manifests live alongside your service code. Each manifest wraps a gRPC method with schema validation, permissions, and PII output policy.
+Tool manifests live alongside the capability they wrap. Each manifest defines inputs, outputs, permissions, and classification -- whether it wraps a gRPC method, a CLI command, or a log query.
 
+**gRPC service call:**
 ```typescript
 // tools/customer-data/get-customer.ts
 import { defineTool, grpcMethod } from "safe-tool-call"
@@ -74,11 +88,9 @@ export const getCustomer = defineTool({
       status: z.string(),
       fullName: z.string(),
       email: z.string(),
-      // ... other fields
     }),
   }),
 
-  // What the LLM is allowed to see
   outputPolicy: {
     "customer.id": "allow",
     "customer.status": "allow",
@@ -88,6 +100,84 @@ export const getCustomer = defineTool({
   },
 })
 ```
+
+**Log query (logcli):**
+```typescript
+// tools/platform/query-logs.ts
+export const queryLogs = defineTool({
+  name: "query_logs",
+  description: "Query application logs from Loki via logcli",
+  classification: "read",
+
+  target: cliCommand({
+    command: "logcli",
+    argsBuilder: (input) => [
+      "query",
+      `{namespace="${input.namespace}"}`,
+      "--limit", String(input.limit),
+      "--from", input.from,
+      "--output", "jsonl",
+    ],
+  }),
+
+  permissions: {
+    required: ["logs:read"],
+  },
+
+  input: z.object({
+    namespace: z.enum(["customer-data", "payments", "onboarding"]),  // bounded!
+    query: z.string().max(200),
+    limit: z.number().int().min(1).max(500).default(100),
+    from: z.string().datetime(),
+  }),
+
+  output: z.object({
+    lines: z.array(z.object({
+      timestamp: z.string(),
+      level: z.string(),
+      message: z.string(),
+    })),
+  }),
+})
+```
+
+**Git diff (read-only):**
+```typescript
+// tools/platform/git-diff-branches.ts
+export const gitDiffBranches = defineTool({
+  name: "git_diff_branches",
+  description: "Show diff between two branches in a repository",
+  classification: "read",
+
+  target: cliCommand({
+    command: "git",
+    argsBuilder: (input) => [
+      "diff", "--stat",
+      `${input.base}..${input.compare}`,
+      "--", input.path ?? ".",
+    ],
+    cwd: (input) => `/repos/${input.repository}`,
+  }),
+
+  permissions: {
+    required: ["git:read"],
+  },
+
+  input: z.object({
+    repository: z.enum(["customer-data", "payments-engine", "onboarding-service"]),
+    base: z.string().regex(/^(main|release\/\d+\.\d+\.\d+)$/),    // only main or release tags
+    compare: z.string().regex(/^(main|release\/\d+\.\d+\.\d+)$/),
+    path: z.string().optional(),
+  }),
+
+  output: z.object({
+    diff: z.string(),
+    filesChanged: z.number(),
+  }),
+})
+```
+
+Notice the pattern: the agent cannot query arbitrary namespaces, diff arbitrary branches, or access arbitrary repositories. The Zod schema **mechanically constrains** what the agent can ask for.
 
 ### Create the Proxy
 
@@ -211,10 +301,14 @@ safe-tool-call/
 ├── src/
 │   ├── core/              # defineTool(), types, output policy engine
 │   ├── proxy/             # Registry, permission engine, schema validator, proxy engine
-│   ├── handlers/          # gRPC handler factory, connection manager, proto loader
+│   ├── handlers/
+│   │   ├── grpc/          # gRPC handler factory, connection manager, proto loader
+│   │   └── cli/           # CLI command handler (logcli, git, kubectl, argocd)
 │   ├── audit/             # Structured JSON audit logger
 │   └── index.ts           # Public API
-├── tools/                 # Example tool manifests (customer-data service)
+├── tools/                 # Example tool manifests
+│   ├── customer-data/     # gRPC service tools (GetCustomer, ListCustomers, etc.)
+│   └── platform/          # CLI-based tools (logs, git, argocd, k8s)
 ├── tests/
 ├── audit-logs/            # Audit output (gitignored)
 ├── plans/                 # Implementation plans
