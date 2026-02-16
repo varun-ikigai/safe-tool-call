@@ -1,10 +1,12 @@
 # Agent Guidelines: Safe Tool Call
 
-You are working on **Safe Tool Call**, a governed runtime proxy for LLM agent tool calls. Read [MANIFESTO.md](./MANIFESTO.md) for the philosophical foundation and [plans/plan.md](./plans/plan.md) for the implementation plan.
+You are working on **Safe Tool Call**, a governed MCP server for LLM agent tool calls. Read [MANIFESTO.md](./MANIFESTO.md) for the philosophical foundation and [plans/plan.md](./plans/plan.md) for the implementation plan.
 
 ## Project Context
 
 This is an embeddable TypeScript/Bun library that sits between LLM agents and infrastructure in financial institutions. It enforces schema validation, permission checking, PII filtering, and audit logging on every tool call -- whether that's a gRPC service method, a logcli query, a git operation, an ArgoCD status check, or a kubectl read.
+
+**Two-layer enforcement:** The agent runs in a locked-down container with no bash, no filesystem, no CLI tools -- it can only reach the LLM API and the MCP server. The MCP server (powered by Safe Tool Call) has the tools, credentials, and governance pipeline. The container enforces exclusivity. The MCP server enforces correctness.
 
 **The core principle:** An agent gets typed, bounded tool calls -- not bash access. The tool definition mechanically constrains what the agent can do. A `query_logs` tool with `namespace: z.enum(["customer-data", "payments"])` cannot query arbitrary namespaces, regardless of what the model decides to try. A `git_diff_branches` tool with `classification: "read"` cannot push, delete, or force-push.
 
@@ -18,6 +20,7 @@ This is an embeddable TypeScript/Bun library that sits between LLM agents and in
 - **Language:** TypeScript (strict mode, no `any`)
 - **Schema validation:** Zod
 - **JWT:** `jose`
+- **Protocol:** MCP (Model Context Protocol) via `@modelcontextprotocol/sdk`
 - **CLI execution:** `Bun.spawn` (array args, no shell -- this is a security invariant)
 - **gRPC:** `@grpc/grpc-js`, `@grpc/proto-loader` (Phase 4, not yet implemented)
 - **Audit:** Structured JSON lines

@@ -67,33 +67,55 @@ We are not a prompt engineering framework. We don't help you write better system
 
 ## The Architecture of Trust
 
-In a Safe Tool Call deployment, an LLM agent has **no bash access, no direct network access, no raw credentials.** It has a set of typed function calls -- and nothing else.
+Safe Tool Call enforces two distinct boundaries, because no single layer is sufficient:
+
+### Layer 1: The Container (Exclusivity)
+
+The agent runs in a locked-down container with no bash, no filesystem access, no network egress except two things: the LLM provider API (outbound, for inference) and the MCP server (for tool calls). The container enforces **what the agent can connect to.** If the agent's only channel to infrastructure is the MCP protocol, then the MCP server's tool registry is the complete set of possible actions. There is nothing else.
+
+### Layer 2: The MCP Server (Governance)
+
+The MCP server -- powered by Safe Tool Call -- enforces **how tools are called.** Schema validation, permission checks, PII filtering, audit logging, bounded execution. Even if the agent has access to the MCP server, it can only call tools it has permission for, with inputs that pass validation, and it only sees outputs that have been filtered.
+
+Neither layer is sufficient alone. The container without governance means the agent can call any tool with any args. The governance without the container means the agent might have other capabilities (bash, filesystem) that bypass the MCP server entirely. Together, they form a complete boundary.
 
 ```
-                  The LLM sees this:
-                  ┌──────────────────────────────┐
-                  │  get_customer(id)             │  ← gRPC service call
-                  │  query_logs(namespace, query) │  ← logcli
-                  │  git_diff_branches(base, cmp) │  ← git (read-only)
-                  │  argocd_get_app(name)         │  ← ArgoCD
-                  │  k8s_get_pods(namespace)      │  ← kubectl (read-only)
-                  │  ...and nothing else.         │
-                  └──────────────┬───────────────┘
-                                │
-                  The proxy enforces this:
-                  ┌──────────────┴───────────────┐
-                  │  Is this tool registered?     │
-                  │  Does the caller have         │
-                  │    permission?                 │
-                  │  Are the inputs valid?         │
-                  │  Is the classification safe?   │
-                  │  [execute via handler]         │
-                  │  Are outputs safe to return?   │
-                  │  [audit everything]            │
-                  └──────────────────────────────┘
+┌─────────────────────────────────────────────────────┐
+│  Locked-Down Agent Container                        │
+│  (no bash, no filesystem, no arbitrary network)     │
+│                                                     │
+│  ┌───────────────────────────┐                      │
+│  │  Agent Loop               │                      │
+│  │                           │──── LLM API ────► OpenRouter / Anthropic / etc.
+│  │  Model sends tool calls   │                      │
+│  │  Model receives results   │                      │
+│  │  ...and nothing else.     │                      │
+│  └─────────────┬─────────────┘                      │
+└────────────────┼────────────────────────────────────┘
+                 │ MCP protocol (the only other channel)
+                 ▼
+┌─────────────────────────────────────────────────────┐
+│  Safe Tool Call MCP Server (in-cluster)             │
+│                                                     │
+│  ┌───────────────────────────────────────────────┐  │
+│  │  Governance Pipeline                          │  │
+│  │  1. Is this tool registered?                  │  │
+│  │  2. Does the caller have permission?          │  │
+│  │  3. Are the inputs valid? (Zod schema)        │  │
+│  │  4. Execute via handler                       │  │
+│  │     ├─ Bun.spawn (logcli, git, kubectl, argo) │  │
+│  │     └─ gRPC call (mTLS to services)           │  │
+│  │  5. Validate output schema                    │  │
+│  │  6. Filter PII (mask/redact)                  │  │
+│  │  7. Write audit entry                         │  │
+│  └───────────────────────────────────────────────┘  │
+│                                                     │
+│  Has: kubectl, logcli, git, argocd, gRPC certs,     │
+│  service credentials. The agent doesn't.            │
+└─────────────────────────────────────────────────────┘
 ```
 
-No amount of context rot, prompt injection, or model hallucination can bypass this boundary. The proxy doesn't read the LLM's reasoning. It validates a structured tool call against a registered schema. That's it.
+No amount of context rot, prompt injection, or model hallucination can bypass this boundary. The container has no tools to exploit. The MCP server validates every call mechanically. The proxy doesn't read the LLM's reasoning -- it validates a structured tool call against a registered schema. That's it.
 
 ## The Developer Experience
 

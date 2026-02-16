@@ -1,44 +1,56 @@
 # Safe Tool Call
 
-A governed runtime proxy for LLM agent tool calls. Define, validate, and audit every interaction between your AI agents and your infrastructure -- gRPC services, log queries, git operations, deployment tools, and anything else an agent needs to touch.
+A governed MCP server for LLM agent tool calls. Two layers of enforcement: a locked-down agent container (the agent can only talk to the MCP server) and a governed MCP server (every tool call is schema-validated, permission-checked, PII-filtered, and audited).
 
 Built for financial institutions. No bash. No raw CLI access. No trust required.
 
 ## The Problem
 
-LLM agents need to interact with your systems. Not just your microservices -- they need to read logs, diff branches, check deployment status, query Kubernetes, trace workflows. The default approach -- bash access with prompt-level restrictions -- offers no mechanical safety guarantees. An agent that can `logcli query` can also `logcli query '{}'` (all logs). An agent that can `git diff` can also `git push --force`. Prompt instructions degrade with context length, are vulnerable to injection, and leave no audit trail.
+LLM agents need to interact with your systems -- read logs, diff branches, check deployments, query services, trace workflows. The default approach is bash access with prompt-level restrictions. But an agent that can `logcli query` can also `logcli query '{}'` (all logs). An agent that can `git diff` can also `git push --force`.
+
+An MCP server alone isn't enough either. MCP governs what tools are *available*, but not what happens when they're called. It has no schema validation, no per-caller permissions, no PII filtering, no audit trail.
 
 ## The Solution
 
-Safe Tool Call sits between your LLM agents and your infrastructure. Teams publish **tool manifests** declaring which capabilities are available to agents, what permissions they require, what inputs are valid, and which output fields are safe to expose. The runtime proxy enforces these declarations on every call.
+Two layers, each enforcing what the other can't:
 
 ```
-Agent                  Safe Tool Call Proxy              Your Infrastructure
-  │                         │                                │
-  ├─ call("get_customer")──►│                                │
-  │                         ├─ JWT verify                    │ gRPC Service
-  │                         ├─ Permission check              │
-  │                         ├─ Zod input validation          │
-  │                         ├─ gRPC call (mTLS) ────────────►│
-  │                         │◄──────────── protobuf response─┤
-  │                         ├─ Output validation             │
-  │                         ├─ PII masking/redaction         │
-  │                         ├─ Audit log write               │
-  │◄─ filtered result ─────┤                                │
-  │                         │                                │
-  ├─ call("query_logs") ───►│                                │ LogCLI
-  │                         ├─ Validates namespace is allowed │
-  │                         ├─ Executes bounded logcli cmd ─►│
-  │                         ├─ Filters sensitive log lines   │
-  │                         ├─ Audit log write               │
-  │◄─ filtered logs ───────┤                                │
-  │                         │                                │
-  ├─ call("git_diff") ────►│                                │ Git (read-only)
-  │                         ├─ Validates branch patterns     │
-  │                         ├─ Executes read-only git cmd ──►│
-  │                         ├─ Audit log write               │
-  │◄─ diff output ─────────┤                                │
+┌──────────────────────────────────────────┐
+│  Agent Container (locked down)           │
+│                                          │
+│  No bash. No filesystem. No CLI tools.   │
+│  Can only reach: LLM API + MCP server.   │
+│                                          │
+│  ┌────────────────────────────────────┐  │
+│  │  Agent Loop                        │  │
+│  │  Discovers tools via MCP           │  │
+│  │  Routes tool calls via MCP         │  │
+│  │  Has no other capabilities         │  │
+│  └──────────────┬─────────────────────┘  │
+└─────────────────┼────────────────────────┘
+                  │ MCP protocol
+                  ▼
+┌──────────────────────────────────────────┐
+│  Safe Tool Call MCP Server (in-cluster)  │
+│                                          │
+│  Has: git, logcli, kubectl, argocd,      │
+│  gRPC certs, service credentials.        │
+│  The agent doesn't.                      │
+│                                          │
+│  Every tool call goes through:           │
+│  1. Registry lookup                      │
+│  2. Permission check (JWT)               │
+│  3. Zod input validation                 │
+│  4. Bounded execution (Bun.spawn/gRPC)   │
+│  5. Output validation                    │
+│  6. PII masking/redaction                │
+│  7. Audit log write                      │
+│                                          │
+│  audit-logs/YYYY-MM-DD.jsonl             │
+└──────────────────────────────────────────┘
 ```
+
+The **container** enforces exclusivity: the agent can only use MCP tools. The **MCP server** enforces governance: tools are called correctly, inputs are valid, outputs are filtered, everything is audited.
 
 ## Quick Start
 
@@ -179,59 +191,40 @@ export const gitDiffBranches = defineTool({
 
 Notice the pattern: the agent cannot query arbitrary namespaces, diff arbitrary branches, or access arbitrary repositories. The Zod schema **mechanically constrains** what the agent can ask for.
 
-### Create the Proxy
+### Start the MCP Server
 
 ```typescript
 import { SafeToolCall } from "safe-tool-call"
 import { getCustomer } from "./tools/customer-data/get-customer"
-import { listCustomers } from "./tools/customer-data/list-customers"
+import { queryLogs } from "./tools/platform/query-logs"
+import { gitDiffBranches } from "./tools/platform/git-diff-branches"
 
-const stc = SafeToolCall.create({
-  tools: [getCustomer, listCustomers],
-
-  systems: {
-    "customer-master-service": {
-      endpoint: "customer-master-service.customer-data.svc:9090",
-      tls: {
-        rootCert: "/certs/ca.pem",
-        clientCert: "/certs/client.pem",
-        clientKey: "/certs/client-key.pem",
-      },
-    },
-  },
-
-  audit: {
-    dir: "./audit-logs",
-  },
-
-  jwt: {
-    publicKey: process.env.JWT_PUBLIC_KEY,
-    // or: jwksUri: "https://auth.internal/.well-known/jwks.json"
-  },
+// Start as an MCP server -- any MCP client can connect
+SafeToolCall.serve({
+  tools: [getCustomer, queryLogs, gitDiffBranches],
+  audit: { dir: "./audit-logs" },
+  transport: "streamable-http", // or "stdio" for local dev
+  port: 3000,
 })
 ```
 
-### Use in Your Agent
+Or use as an embedded library:
 
 ```typescript
-// The agent presents a JWT with its permissions
-const jwt = "eyJhbGciOiJSUzI1NiIs..."
+const stc = SafeToolCall.create({
+  tools: [getCustomer, queryLogs, gitDiffBranches],
+  audit: { dir: "./audit-logs" },
+})
 
-// Call a tool -- schema-validated, permission-checked, PII-filtered, audited
+// Call a tool directly -- schema-validated, permission-checked, PII-filtered, audited
 const result = await stc.call("get_customer", { customerId: "abc-123" }, jwt)
 
 if (result.ok) {
-  // result.data contains the filtered output (PII masked/redacted)
-  console.log(result.data)
+  console.log(result.data)  // filtered output (PII masked/redacted)
 } else {
-  // result.error contains a typed, actionable error
   console.log(result.error.code)    // "PERMISSION_DENIED"
   console.log(result.error.message) // "Missing permission: customer-data:read"
 }
-
-// List available tools (for LLM function calling)
-const tools = stc.listTools()
-// Returns OpenAI-compatible function definitions
 ```
 
 ## Key Concepts
@@ -302,13 +295,18 @@ safe-tool-call/
 │   ├── core/              # defineTool(), types, output policy engine
 │   ├── proxy/             # Registry, permission engine, schema validator, proxy engine
 │   ├── handlers/
-│   │   ├── grpc/          # gRPC handler factory, connection manager, proto loader
-│   │   └── cli/           # CLI command handler (logcli, git, kubectl, argocd)
+│   │   ├── cli/           # CLI command handler (Bun.spawn -- logcli, git, kubectl, argocd)
+│   │   └── grpc/          # gRPC handler factory (future)
+│   ├── mcp/               # MCP server adapter
 │   ├── audit/             # Structured JSON audit logger
 │   └── index.ts           # Public API
 ├── tools/                 # Example tool manifests
-│   ├── customer-data/     # gRPC service tools (GetCustomer, ListCustomers, etc.)
+│   ├── customer-data/     # gRPC service tools (future)
 │   └── platform/          # CLI-based tools (logs, git, argocd, k8s)
+├── eval/                  # Containerised adversarial eval harness
+│   ├── agent/             # Locked-down agent container (no bash, no tools)
+│   ├── server/            # MCP server container (has tools + governance)
+│   └── cases/             # Eval YAML cases (boundary + capability tests)
 ├── tests/
 ├── audit-logs/            # Audit output (gitignored)
 ├── plans/                 # Implementation plans
@@ -321,10 +319,13 @@ safe-tool-call/
 
 - **Runtime:** [Bun](https://bun.sh)
 - **Language:** TypeScript (strict mode)
+- **Protocol:** [MCP](https://modelcontextprotocol.io) (Model Context Protocol)
 - **Schema validation:** [Zod](https://zod.dev)
-- **gRPC:** `@grpc/grpc-js` + `@grpc/proto-loader`
+- **CLI execution:** `Bun.spawn` (array args, no shell)
+- **gRPC:** `@grpc/grpc-js` + `@grpc/proto-loader` (future)
 - **JWT:** `jose`
 - **Audit:** Structured JSON lines (`.jsonl`)
+- **Eval:** Docker, OpenRouter API
 
 ## Documentation
 
