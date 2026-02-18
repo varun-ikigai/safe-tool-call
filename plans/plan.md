@@ -7,20 +7,23 @@ Build a governed MCP server that constrains LLM agents to a declared set of type
 **Approach:** Start with CLI command handlers (Bun.spawn), not gRPC. Build the governance pipeline, wrap it in an MCP server, deploy both layers in Docker, and prove the boundary holds with adversarial evals.
 
 **Tech stack:** TypeScript, Bun, Zod, MCP SDK, Docker, OpenRouter  
-**Target environment:** Two-container setup -- locked-down agent container talks to Safe Tool Call MCP server over MCP protocol
+**Target environment:** Two-container setup -- locked-down agent container talks to Safe Tool Call MCP server over MCP protocol  
+**Design decisions:** See [DESIGN_DECISIONS.md](../DESIGN_DECISIONS.md) for resolved architectural questions
 
 ---
 
 ## Architecture
 
-Two containers. The agent container has no tools, no CLI, no filesystem access, no network except the LLM API and the MCP server. The MCP server container has the tools, credentials, and governance pipeline.
+Two containers, two products. **Guardian Agents** is the agent runtime -- a hardened agent loop (built on FastAgent) in a locked-down container with no tools, no CLI, no filesystem access, no network except the LLM API and the MCP server. Rate limiting, checkpoint review, kill switches, and cost controls are baked into the runtime. **Guardian Tool Calls** is the governed MCP server with the tools, credentials, and governance pipeline.
 
 ```
 ┌──────────────────────────────────────────┐
-│  Agent Container (locked down)           │
+│  Guardian Agents (the agent runtime)     │
+│  Built on FastAgent. Governance baked in.│
 │                                          │
 │  No bash. No filesystem. No CLI tools.   │
-│  Network: only LLM API + MCP server.     │
+│  Rate limiting. Checkpoint review.       │
+│  Kill switch. Cost controls.             │
 │                                          │
 │  ┌────────────────────────────────────┐  │
 │  │  Agent Loop                        │  │
@@ -32,7 +35,7 @@ Two containers. The agent container has no tools, no CLI, no filesystem access, 
                   │ MCP protocol (only connection to tools)
                   ▼
 ┌──────────────────────────────────────────┐
-│  Safe Tool Call MCP Server               │
+│  Guardian Tool Calls (governed MCP srv)  │
 │                                          │
 │  Has: git, ls, cat, grep (+ logcli,      │
 │  kubectl, argocd in production)          │
@@ -58,6 +61,39 @@ Two containers. The agent container has no tools, no CLI, no filesystem access, 
 
 ---
 
+## Authentication Model
+
+A complete deployment consists of 3 services:
+
+| Service | Identity | JWT | Permissions |
+|---------|----------|-----|-------------|
+| MCP Server | N/A | Validates incoming | Enforces policy |
+| Gateway Agent | Service account | Passes user's JWT to MCP | Human's permissions |
+| Autonomous Agent | Service account | None | Config-defined (from safe-agent-factory) |
+
+### Auth Flow
+
+**Gateway Agent (Human-initiated):**
+1. User logs into web UI
+2. Web UI passes user's JWT to gateway agent
+3. Gateway agent forwards JWT to MCP server in HTTP header
+4. MCP server validates JWT, checks user's permissions against tool requirements
+
+**Autonomous Agent:**
+1. Container has service account identity only
+2. No JWT passed to MCP server
+3. MCP server uses static permissions from startup config (produced by safe-agent-factory CI)
+
+### Caller Identification
+
+MCP server identifies the caller via **container identity** (service account token):
+- Gateway agent → validate forwarded JWT → check human's permissions
+- Autonomous agent → use config-defined permissions
+
+The MCP server **always** validates the caller's identity. For gateway agents, this means validating the JWT. For autonomous agents, this means verifying the service account.
+
+---
+
 ## Phase 1: Core Pipeline
 
 **Goal:** The proxy engine that validates, executes, and audits tool calls. CLI handler via Bun.spawn. No gRPC yet.
@@ -66,7 +102,7 @@ Two containers. The agent container has no tools, no CLI, no filesystem access, 
 
 - [ ] Bun project with TypeScript strict mode
 - [ ] `bunfig.toml`, `tsconfig.json`, `package.json`
-- [ ] Dependencies: `zod`, `jose` (JWT), `@modelcontextprotocol/sdk` (MCP server SDK)
+- [ ] Dependencies: `zod`, `jose` (JWT), `@modelcontextprotocol/server@^1.0.0` (MCP server SDK, v1.x -- v2 is pre-alpha)
 - [ ] Directory structure:
   ```
   src/
@@ -89,10 +125,11 @@ Two containers. The agent container has no tools, no CLI, no filesystem access, 
 - [ ] `ToolDefinition<TInput, TOutput>` -- the manifest type
 - [ ] `ToolClassification` -- `"read" | "write" | "destructive"`
 - [ ] `ToolHandler<TInput, TOutput>` -- async function `(input: TInput, ctx: HandlerContext) => Promise<TOutput>`
+- [ ] `HandlerContext` -- minimal for MVP: `{ traceId: string, timeout: number }`. Evolves when deployment patterns emerge (see DESIGN_DECISIONS.md §6)
 - [ ] `CliTarget` -- command (string), argsBuilder function, optional cwd, optional env
 - [ ] `ToolPermissions` -- required permissions, optional elevated permissions with condition
-- [ ] `OutputFieldPolicy` -- `"allow" | "mask" | "redact"` per field path
-- [ ] `CallerContext` -- decoded JWT claims (sub, permissions, iat, exp)
+- [ ] `OutputFieldPolicy` -- `"allow" | "mask" | "redact"` per field path (jq-style path syntax, see DESIGN_DECISIONS.md §2)
+- [ ] `CallerContext` -- decoded JWT claims (sub, permissions, iat, exp) OR static config permissions (for autonomous agents). Source-agnostic: proxy only sees `{ sub, permissions }`
 - [ ] `AuditEntry` -- structured audit log record
 - [ ] `ToolCallResult<T>` -- discriminated union: `{ ok: true, data: T }` | `{ ok: false, error: ToolCallError }`
 - [ ] `ToolCallError` -- `{ code: string, message: string, stage: string, details?: unknown }`
@@ -101,7 +138,7 @@ Two containers. The agent container has no tools, no CLI, no filesystem access, 
 
 - [ ] Type-safe function that returns a frozen `ToolDefinition`
 - [ ] Infers `TInput` and `TOutput` from Zod schemas via `z.infer<>`
-- [ ] Validates at definition time: schemas are valid Zod objects, classification is set, permissions non-empty
+- [ ] Validates at definition time: schemas are valid Zod objects, classification is set, permissions non-empty, tool name is snake_case, handler is provided. See DESIGN_DECISIONS.md §7 for what's deferred.
 - [ ] Handler is either an inline async function or a `cliCommand()` factory result
 
 ### 1.4 CLI Command Handler (`src/handlers/cli/handler.ts`)
@@ -114,6 +151,7 @@ Two containers. The agent container has no tools, no CLI, no filesystem access, 
   - Optional `allowedCommands` allowlist at proxy level -- reject any command not in the list
 - [ ] Captures stdout + stderr as strings
 - [ ] Timeout via `AbortSignal` (default 30s, configurable per tool)
+- [ ] Timeout fires → `ToolCallError` with stage `"EXECUTION"`, logged as `ERROR` (not DENIED -- it's an execution failure, not a policy denial). Retryable at agent's discretion.
 - [ ] Non-zero exit code → `ToolCallError` with stage `"EXECUTION"`
 - [ ] `outputParser` option: `"text" | "json" | "jsonl" | custom function`
 - [ ] Strip ANSI escape codes from output
@@ -138,14 +176,21 @@ Two containers. The agent container has no tools, no CLI, no filesystem access, 
 - [ ] `validateInput(schema, args)` → `{ ok: true, data } | { ok: false, errors }`
 - [ ] `validateOutput(schema, result)` → same shape
 - [ ] Wraps `schema.safeParse()` with structured error formatting
-- [ ] Input validation errors → returned to caller (so the LLM can fix its args)
-- [ ] Output validation errors → logged, not returned (internal error)
+- [ ] Input validation errors → returned to caller with Zod error details (field path, expected vs. received) so the LLM can fix its args
+- [ ] Output validation errors → logged, generic error returned (internal error)
+- [ ] Permission errors → generic "operation not permitted" (no detail to agent)
+- [ ] All errors use MCP SDK's native `isError: true` in `CallToolResult` (see DESIGN_DECISIONS.md §4)
 
 ### 1.8 Output Policy Engine (`src/core/output-policy.ts`)
 
 - [ ] `filterOutput(data, policy)` → `{ filtered: object, redactedPaths: string[] }`
 - [ ] Traverses object applying per-field-path rules: `"allow"`, `"mask"`, `"redact"`
-- [ ] Glob pattern support: `"customer.*"`, `"*.email"`, `"*"` (catch-all)
+- [ ] **jq-style path syntax:**
+  - `.customer.id` — exact leaf field
+  - `.customer.name` — entire object (redacts subtree)
+  - `.customer[].email` — leaf field in array elements
+  - `..email` — recursive descent (any field named `email` at any depth)
+  - Most specific path wins (`.customer.name.first_name: "allow"` overrides `..first_name: "redact"`)
 - [ ] **Default is deny** -- fields not matching any rule are stripped
 - [ ] Masking: first char + `***` + last char for strings. Full redact for objects/arrays.
 - [ ] Returns list of redacted field paths for audit entry
@@ -184,6 +229,7 @@ Two containers. The agent container has no tools, no CLI, no filesystem access, 
   ```
 - [ ] Fire-and-forget: audit write failures log to stderr, never fail the tool call
 - [ ] PII in input args → hashed, never logged in cleartext
+- [ ] **Configurable debug mode:** `production` (default) hashes all input args; `debug` logs non-PII fields in cleartext, hashes PII fields declared via `piiFields` on the tool definition. Debug mode emits a loud stderr warning on startup.
 
 ### 1.10 Proxy Engine (`src/proxy/proxy.ts`)
 
@@ -205,7 +251,8 @@ Two containers. The agent container has no tools, no CLI, no filesystem access, 
 ### 1.11 MCP Server Adapter (`src/mcp/server.ts`)
 
 - [ ] Thin adapter that wraps the proxy pipeline as an MCP server
-- [ ] Uses `@modelcontextprotocol/sdk` `McpServer` class
+- [ ] Uses `@modelcontextprotocol/server` `McpServer` class
+- [ ] **Static loading:** All tool manifests loaded at startup. No dynamic add/remove without restart. Deliberate MVP choice for simplicity and thread-safety.
 - [ ] On startup: registers each tool from the registry as an MCP tool
   ```typescript
   for (const tool of proxy.listTools()) {
@@ -218,7 +265,7 @@ Two containers. The agent container has no tools, no CLI, no filesystem access, 
 - [ ] MCP tool discovery (`tools/list`) → returns tools from registry
 - [ ] MCP tool invocation (`tools/call`) → routes through full governance pipeline
 - [ ] Transport: stdio for local dev, streamable HTTP for container-to-container
-- [ ] Caller context: extracted from MCP session metadata or configured per-server
+- [ ] Caller context: JWT from MCP session metadata (gateway agents) or static config (autonomous agents, loaded at startup from safe-agent-factory artifact)
 
 ### 1.12 Public API (`src/index.ts`)
 
@@ -406,6 +453,31 @@ Simple, safe tools that demonstrate bounded command execution:
 - [ ] `k8s_get_pods` / `k8s_get_events` / `k8s_get_logs` -- read-only Kubernetes tools
 - [ ] `git_diff_branches` / `git_log` / `git_show_file` -- read-only git tools with regex-constrained branches
 - [ ] All tools `classification: "read"` initially. Write/destructive tools added later with elevated permissions.
+
+---
+
+## PII Field Reference (customer-master-service)
+
+From the reference proto in `reference_data/customer-data/`. These fields require output policy coverage when wrapping customer data tools (Phase 4+).
+
+**Directly identifying:**
+- `name.*` (first_name, middle_name, last_name)
+- `date_of_birth.*`
+- `address.*` (line_1, city, state, postcode, country)
+- `phone_number`, `primary_phone_number`, `secondary_phone_number`, `next_of_kin_phone_number`
+- `email`, `cro_email`
+- `document_id_number`
+
+**Financial:**
+- `annual_income_v2.*`
+- `net_worth.*`
+
+**Family/Personal:**
+- `spouse_name.*`, `spouse_date_of_birth.*`
+- `next_of_kin*`
+- `employer_name`, `employer_address`
+
+**Future consideration:** Proto decorator `[(pii) = true]` to auto-generate output policies.
 
 ---
 

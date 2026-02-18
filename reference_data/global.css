@@ -1,0 +1,182 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: 'Inter', var(--font-geist-sans);
+  --font-mono: 'JetBrains Mono', var(--font-jetbrains-mono), ui-monospace, monospace;
+  --color-sidebar-ring: var(--sidebar-ring);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar: var(--sidebar);
+  --color-chart-5: var(--chart-5);
+  --color-chart-4: var(--chart-4);
+  --color-chart-3: var(--chart-3);
+  --color-chart-2: var(--chart-2);
+  --color-chart-1: var(--chart-1);
+  --color-ring: var(--ring);
+  --color-input: var(--input);
+  --color-border: var(--border);
+  --color-destructive: var(--destructive);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-accent: var(--accent);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-muted: var(--muted);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-secondary: var(--secondary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-primary: var(--primary);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-popover: var(--popover);
+  --color-card-foreground: var(--card-foreground);
+  --color-card: var(--card);
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+  --radius-2xl: calc(var(--radius) + 8px);
+  --radius-3xl: calc(var(--radius) + 12px);
+  --radius-4xl: calc(var(--radius) + 16px);
+
+  /* Ikigai brand colors */
+  --color-ikigai-cyan: #2DFFFF;
+  --color-ikigai-purple: #7822FF;
+  --color-ikigai-dark: #0C0028;
+  --color-ikigai-dark-secondary: #050039;
+  --color-ikigai-dark-tertiary: #161042;
+  --color-ikigai-dark-quaternary: #332651;
+  --color-ikigai-dark-quintinary: #241D58;
+  --color-ikigai-muted: #D8D0EA;
+}
+
+/* Ikigai dark theme — this is a dark-first brand */
+:root {
+  --radius: 0.625rem;
+  --background: #0C0028;
+  --foreground: #FFFFFF;
+  --card: #161042;
+  --card-foreground: #FFFFFF;
+  --popover: #161042;
+  --popover-foreground: #FFFFFF;
+  --primary: #7822FF;
+  --primary-foreground: #FFFFFF;
+  --secondary: #332651;
+  --secondary-foreground: #FFFFFF;
+  --muted: #241D58;
+  --muted-foreground: #D8D0EA;
+  --accent: #2DFFFF;
+  --accent-foreground: #0C0028;
+  --destructive: #ED0000;
+  --border: #332651;
+  --input: #332651;
+  --ring: #7822FF;
+  --chart-1: #7822FF;
+  --chart-2: #2DFFFF;
+  --chart-3: #D8D0EA;
+  --chart-4: #332651;
+  --chart-5: #050039;
+  --sidebar: #050039;
+  --sidebar-foreground: #FFFFFF;
+  --sidebar-primary: #7822FF;
+  --sidebar-primary-foreground: #FFFFFF;
+  --sidebar-accent: #241D58;
+  --sidebar-accent-foreground: #FFFFFF;
+  --sidebar-border: #332651;
+  --sidebar-ring: #7822FF;
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  body {
+    @apply bg-background text-foreground;
+    font-family: 'Inter', sans-serif;
+  }
+}
+
+/* Ikigai brand utilities */
+@layer utilities {
+  .text-gradient {
+    background: linear-gradient(135deg, #2DFFFF, #7822FF);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+  }
+
+  .bg-gradient-brand {
+    background: linear-gradient(135deg, #7822FF, #2DFFFF);
+  }
+
+  .bg-gradient-dark {
+    background: linear-gradient(180deg, #0C0028 0%, #050039 100%);
+  }
+
+  .bg-gradient-card {
+    background: linear-gradient(180deg, #161042 0%, #241D58 100%);
+  }
+
+  .glow-cyan {
+    box-shadow: 0 0 20px rgba(45, 255, 255, 0.15), 0 0 60px rgba(45, 255, 255, 0.05);
+  }
+
+  .glow-purple {
+    box-shadow: 0 0 20px rgba(120, 34, 255, 0.2), 0 0 60px rgba(120, 34, 255, 0.08);
+  }
+
+  .border-gradient {
+    border: 1px solid transparent;
+    background-clip: padding-box;
+    position: relative;
+  }
+
+  .border-gradient::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    border-radius: inherit;
+    padding: 1px;
+    background: linear-gradient(135deg, #7822FF, #2DFFFF);
+    -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+    -webkit-mask-composite: xor;
+    mask-composite: exclude;
+    pointer-events: none;
+  }
+
+  .eyebrow {
+    font-size: 0.88rem;
+    font-weight: 500;
+    letter-spacing: 0.3em;
+    text-transform: uppercase;
+    color: #2DFFFF;
+  }
+}
+
+/* Smooth scrolling */
+html {
+  scroll-behavior: smooth;
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+}
+::-webkit-scrollbar-track {
+  background: #0C0028;
+}
+::-webkit-scrollbar-thumb {
+  background: #332651;
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #7822FF;
+}
+

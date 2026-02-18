@@ -67,55 +67,19 @@ We are not a prompt engineering framework. We don't help you write better system
 
 ## The Architecture of Trust
 
-Safe Tool Call enforces two distinct boundaries, because no single layer is sufficient:
+Guardian enforces two distinct boundaries through two products, because no single layer is sufficient:
 
-### Layer 1: The Container (Exclusivity)
+### Guardian Agents (The Runtime)
 
-The agent runs in a locked-down container with no bash, no filesystem access, no network egress except two things: the LLM provider API (outbound, for inference) and the MCP server (for tool calls). The container enforces **what the agent can connect to.** If the agent's only channel to infrastructure is the MCP protocol, then the MCP server's tool registry is the complete set of possible actions. There is nothing else.
+The agent runtime is Guardian Agents -- a hardened agent loop (built on FastAgent) running in a locked-down container with no bash, no filesystem access, no network egress except two things: the LLM provider API (outbound, for inference) and the MCP server (for tool calls). Rate limiting, checkpoint review, kill switches, and cost controls are baked into the runtime. The container enforces **what the agent can connect to**, and the runtime enforces **how the agent behaves**.
 
-### Layer 2: The MCP Server (Governance)
+### Guardian Tool Calls (The MCP Server)
 
-The MCP server -- powered by Safe Tool Call -- enforces **how tools are called.** Schema validation, permission checks, PII filtering, audit logging, bounded execution. Even if the agent has access to the MCP server, it can only call tools it has permission for, with inputs that pass validation, and it only sees outputs that have been filtered.
+The MCP server -- powered by Guardian Tool Calls -- enforces **how tools are called.** Schema validation, permission checks, PII filtering, audit logging, bounded execution. Even if the agent has access to the MCP server, it can only call tools it has permission for, with inputs that pass validation, and it only sees outputs that have been filtered.
 
-Neither layer is sufficient alone. The container without governance means the agent can call any tool with any args. The governance without the container means the agent might have other capabilities (bash, filesystem) that bypass the MCP server entirely. Together, they form a complete boundary.
+Neither product is sufficient alone. Guardian Agents without Guardian Tool Calls means the agent is locked down but tool calls are ungoverned. Guardian Tool Calls without Guardian Agents means tool calls are governed but the agent can loop, overspend, and behave erratically. Together, they form a complete boundary.
 
-```
-┌─────────────────────────────────────────────────────┐
-│  Locked-Down Agent Container                        │
-│  (no bash, no filesystem, no arbitrary network)     │
-│                                                     │
-│  ┌───────────────────────────┐                      │
-│  │  Agent Loop               │                      │
-│  │                           │──── LLM API ────► OpenRouter / Anthropic / etc.
-│  │  Model sends tool calls   │                      │
-│  │  Model receives results   │                      │
-│  │  ...and nothing else.     │                      │
-│  └─────────────┬─────────────┘                      │
-└────────────────┼────────────────────────────────────┘
-                 │ MCP protocol (the only other channel)
-                 ▼
-┌─────────────────────────────────────────────────────┐
-│  Safe Tool Call MCP Server (in-cluster)             │
-│                                                     │
-│  ┌───────────────────────────────────────────────┐  │
-│  │  Governance Pipeline                          │  │
-│  │  1. Is this tool registered?                  │  │
-│  │  2. Does the caller have permission?          │  │
-│  │  3. Are the inputs valid? (Zod schema)        │  │
-│  │  4. Execute via handler                       │  │
-│  │     ├─ Bun.spawn (logcli, git, kubectl, argo) │  │
-│  │     └─ gRPC call (mTLS to services)           │  │
-│  │  5. Validate output schema                    │  │
-│  │  6. Filter PII (mask/redact)                  │  │
-│  │  7. Write audit entry                         │  │
-│  └───────────────────────────────────────────────┘  │
-│                                                     │
-│  Has: kubectl, logcli, git, argocd, gRPC certs,     │
-│  service credentials. The agent doesn't.            │
-└─────────────────────────────────────────────────────┘
-```
-
-No amount of context rot, prompt injection, or model hallucination can bypass this boundary. The container has no tools to exploit. The MCP server validates every call mechanically. The proxy doesn't read the LLM's reasoning -- it validates a structured tool call against a registered schema. That's it.
+No amount of context rot, prompt injection, or model hallucination can bypass this boundary. The agent runtime has no tools to exploit. The MCP server validates every call mechanically. The proxy doesn't read the LLM's reasoning -- it validates a structured tool call against a registered schema. That's it.
 
 ## The Developer Experience
 
@@ -157,6 +121,116 @@ We are betting that:
 - Mechanical safety boundaries will be required by regulators, not optional best practices.
 - The tool call layer is the right place to enforce these boundaries -- above the service, below the model.
 - The gap between model capability and model trustworthiness will widen, not narrow. The more a model can do, the more damage it can cause, and the more essential mechanical governance becomes.
+
+## The Complete Safety Stack
+
+Guardian is a two-product safety stack for enterprise LLM agents. Not two separate services bolted together -- two products that **are** the architecture.
+
+### Guardian Tool Calls
+
+The governed MCP server that sits between agents and infrastructure.
+
+**What it enforces:**
+- **Registry enforcement** -- only registered tools exist; anything else is mechanically denied
+- **Schema validation** -- inputs must match declared Zod schemas before execution
+- **Permission checks** -- JWT-based authorization; callers can only call tools they have permissions for
+- **Output filtering** -- PII fields are masked/redacted before reaching the agent
+- **Audit logging** -- every call (allowed or denied) is logged with full context
+- **Classification** -- tools marked as `read`, `write`, or `destructive` with enforced boundaries
+
+**The guarantee:** An agent can only do exactly what its tool manifest allows. This is mechanically enforced, not advisory.
+
+### Guardian Agents
+
+The governed agent runtime -- **the agent itself**, not a sidecar watching it. Guardian Agents is a hardened agent runtime (built on FastAgent) with governance baked into the agent loop. The agent container in the architecture diagram **is** Guardian Agents.
+
+**What's built into the runtime:**
+- **Locked-down container** -- no bash, no filesystem, no CLI tools, no arbitrary network. The agent can only reach the LLM API and the MCP server.
+- **Rate limiting** -- prevent runaway loops; configurable calls per minute/hour
+- **Checkpoint review** -- after every N steps, a secondary model reviews the last N actions for anomalies
+- **Kill switch** -- human operators can instantly halt an agent
+- **Cost controls** -- budget limits per agent per time period
+- **Behavioral analysis** -- detect patterns that indicate confusion, looping, or tool misuse
+- **Correlation with audit** -- link Guardian Tool Calls logs with agent behavior for full traceability
+
+**The guarantee:** The agent itself is governed. It's not a raw LLM loop with tools -- it's a runtime that enforces behavioral constraints mechanically.
+
+### Why Both Products Matter
+
+A CISO will ask: "What's the worst that can happen?"
+
+**With only Guardian Tool Calls (no governed runtime):**
+- Agent has valid tool access but calls `list_files` 1000 times
+- Agent enters a loop calling the wrong tool repeatedly
+- Agent runs for hours racking up API costs
+- Agent makes a valid tool call that is part of a malicious pattern
+
+**With the full stack (Guardian Agents + Guardian Tool Calls):**
+- Rate limit catches the loop
+- Checkpoint review flags strange behavior
+- Kill switch stops it immediately
+- Cost controls cap the damage
+
+Guardian Tool Calls governs **what agents are allowed to do**. Guardian Agents governs **what they're actually doing**. One is the MCP server. The other is the agent. Together, they ARE the architecture -- not layers on top of it.
+
+### The Architecture
+
+```
+┌─────────────────────────────────────────────────────┐
+│  Guardian Agents (the agent runtime)                │
+│  Built on FastAgent. Governance baked in.           │
+│                                                     │
+│  No bash. No filesystem. No CLI tools.              │
+│  Rate limiting. Checkpoint review. Kill switch.     │
+│                                                     │
+│  ┌───────────────────────────┐                      │
+│  │  Agent Loop               │                      │
+│  │                           │──── LLM API ────► OpenRouter / Anthropic / etc.
+│  │  Model sends tool calls   │                      │
+│  │  Model receives results   │                      │
+│  │  ...and nothing else.     │                      │
+│  └─────────────┬─────────────┘                      │
+└────────────────┼────────────────────────────────────┘
+                 │ MCP protocol (the only other channel)
+                 ▼
+┌─────────────────────────────────────────────────────┐
+│  Guardian Tool Calls (the governed MCP server)      │
+│                                                     │
+│  ┌───────────────────────────────────────────────┐  │
+│  │  Governance Pipeline                          │  │
+│  │  1. Is this tool registered?                  │  │
+│  │  2. Does the caller have permission?          │  │
+│  │  3. Are the inputs valid? (Zod schema)        │  │
+│  │  4. Execute via handler                       │  │
+│  │     ├─ Bun.spawn (logcli, git, kubectl, argo) │  │
+│  │     └─ gRPC call (mTLS to services)           │  │
+│  │  5. Validate output schema                    │  │
+│  │  6. Filter PII (mask/redact)                  │  │
+│  │  7. Write audit entry                         │  │
+│  └───────────────────────────────────────────────┘  │
+│                                                     │
+│  Has: kubectl, logcli, git, argocd, gRPC certs,     │
+│  service credentials. The agent doesn't.            │
+└─────────────────────────────────────────────────────┘
+```
+
+### The Market Gap
+
+Nothing like this exists.
+
+- **Agent frameworks** (LangChain, AutoGen, FastAgent) build agents, don't protect them
+- **ML observability** (Galileo, Arize) monitors model quality, not runtime agent behavior
+- **Content filtering** sanitizes outputs, doesn't control actions
+- **MCP** defines the protocol, not the governance
+
+Enterprise banks want agents in production. Regulators will demand proof. The gap between "we trust the model" and "we can prove it's safe" is what we're filling -- with two products that are the architecture itself, not afterthoughts bolted on.
+
+### The Commitment
+
+1. **Guardian Tool Calls** (MVP) -- ship the governed MCP server first
+2. **Guardian Agents** -- ship the governed agent runtime on top
+
+Neither is complete without the other. Guardian Tool Calls without Guardian Agents means an ungoverned agent with governed tools -- it can still loop, overspend, and behave erratically. Guardian Agents without Guardian Tool Calls means a governed runtime with ungoverned tool calls -- schema validation, PII filtering, and audit are missing. Together, they form the complete boundary.
 
 ## Principles
 

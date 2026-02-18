@@ -1,0 +1,79 @@
+@import "tailwindcss";
+
+@theme inline {
+  /* Brand Colors */
+  --color-brand-cyan: #2DFFFF;
+  --color-brand-purple: #7822FF;
+  --color-brand-dark: #0C0028;
+  --color-brand-dark-secondary: #050039;
+  --color-brand-dark-tertiary: #161042;
+  --color-brand-dark-quaternary: #332651;
+  --color-brand-dark-quintinary: #241D58;
+  --color-brand-white: #FFFFFF;
+  --color-brand-muted: #D8D0EA;
+
+  /* Font */
+  --font-sans: "Inter", -apple-system, BlinkMacSystemFont, sans-serif;
+}
+
+/* ─── Base ─────────────────────────────────────────────── */
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  background-color: #0C0028;
+  color: #FFFFFF;
+  font-family: "Inter", -apple-system, BlinkMacSystemFont, sans-serif;
+}
+
+/* ─── Scrollbar ────────────────────────────────────────── */
+
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: #0C0028; }
+::-webkit-scrollbar-thumb { background: #332651; border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: #7822FF; }
+
+/* ─── Utility Classes ──────────────────────────────────── */
+
+.text-gradient-brand {
+  background: linear-gradient(135deg, #2DFFFF, #7822FF);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+.text-gradient-cyan-white {
+  background: linear-gradient(135deg, #2DFFFF 0%, #FFFFFF 70%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+.bg-gradient-dark {
+  background: linear-gradient(180deg, #0C0028 0%, #050039 100%);
+}
+
+.bg-gradient-card {
+  background: linear-gradient(45deg, #161042 0%, #241D58 100%);
+}
+
+.bg-gradient-section {
+  background: linear-gradient(180deg, #050039 0%, #0C0028 100%);
+}
+
+.glow-cyan {
+  box-shadow: 0 0 20px rgba(45, 255, 255, 0.15), 0 0 60px rgba(45, 255, 255, 0.05);
+}
+
+.glow-purple {
+  box-shadow: 0 0 20px rgba(120, 34, 255, 0.2), 0 0 60px rgba(120, 34, 255, 0.08);
+}
+
+/* ─── Selection ────────────────────────────────────────── */
+
+::selection {
+  background-color: rgba(120, 34, 255, 0.4);
+  color: #FFFFFF;
+}

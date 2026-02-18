@@ -331,6 +331,8 @@ safe-tool-call/
 
 - [MANIFESTO.md](./MANIFESTO.md) -- Why Safe Tool Call exists
 - [plans/plan.md](./plans/plan.md) -- Detailed implementation plan
+- [DESIGN_DECISIONS.md](./DESIGN_DECISIONS.md) -- Resolved architectural decisions
+- [FAQ.md](./FAQ.md) -- Anticipated questions and answers
 - [AGENTS.md](./AGENTS.md) -- Guidelines for AI agents contributing to this project
 
 ## Built by
